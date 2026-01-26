@@ -1,0 +1,177 @@
+# modules/wisp.py
+"""
+<manifest>
+version: 1.0.2
+source: https://raw.githubusercontent.com/AresUser1/wisp/main/wisp.py
+author: SynForge
+</manifest>
+
+Модуль для отправки секретных сообщений.
+"""
+
+import uuid
+import re
+from telethon import events
+from telethon.tl.custom import Button
+from telethon.tl.functions.users import GetFullUserRequest
+from telethon.errors import RPCError
+
+from utils.loader import register, inline_handler, callback_handler
+from handlers.user_commands import _call_inline_bot
+
+@register("wisp")
+async def wisp_cmd(event):
+    """Отправить секретное сообщение.
+    
+    Usage: {prefix}wisp <id/username> <текст>
+    Инлайн: @bot wisp <id/username> <текст>
+    """
+    args = event.pattern_match.group(1)
+    if not args:
+        return await event.edit("❌ <b>Использование:</b> <code>.wisp <id/username> <текст></code>", parse_mode='html')
+
+    # Регулярка для разделения получателя и текста
+    match = re.match(r"^(\d+|@\w+)\s+(.*)", args, re.DOTALL)
+    if not match:
+        return await event.edit("❌ <b>Неверный формат.</b>\nПример: <code>.wisp @user привет</code>", parse_mode='html')
+
+    target = match.group(1)
+    message_text = match.group(2).strip()
+
+    if not message_text:
+        return await event.edit("❌ <b>Введите текст сообщения.</b>", parse_mode='html')
+
+    # Ограничение на длину
+    if len(message_text) > 200:
+        message_text = message_text[:197] + "..."
+
+    if not event.client.bot_client:
+        return await event.edit("❌ <b>Бот-помощник не подключен!</b>", parse_mode='html')
+
+    # МГНОВЕННО затираем секрет в чате, чтобы анти-удалялки видели только это
+    try:
+        bot_info = await event.client.bot_client.get_me()
+        bot_username = bot_info.username
+    except:
+        bot_username = "bot"
+
+    wisp_id = str(uuid.uuid4())[:8]
+    await event.edit(f"@{bot_username} wisp:{wisp_id}")
+
+    try:
+        # Теперь спокойно ищем пользователя
+        if target.startswith("@"):
+            user = await event.client.get_entity(target)
+            recipient_id = int(user.id)
+            recipient_name = user.first_name or "Пользователь"
+        else:
+            try:
+                user = await event.client.get_entity(int(target))
+                recipient_id = int(user.id)
+                recipient_name = user.first_name or "Пользователь"
+            except:
+                # Если бот не видит юзера, но введен ID - используем его напрямую
+                recipient_id = int(target)
+                recipient_name = target
+    except Exception as e:
+        return await event.edit(f"❌ <b>Не удалось найти пользователя:</b> <code>{target}</code>", parse_mode='html')
+
+    sender_id = (await event.client.get_me()).id
+
+    from utils import database as db
+    db.set_module_data("wisp", f"msg_{wisp_id}", {
+        "text": message_text,
+        "recipient_id": int(recipient_id),
+        "sender_id": int(sender_id),
+        "recipient_name": recipient_name
+    })
+
+    query = f"wisp:{wisp_id}"
+    await _call_inline_bot(event, query)
+
+@inline_handler(r"wisp:(.+)", title="Секретное сообщение", description="Отправить секретку")
+async def wisp_inline(event):
+    wisp_id = event.pattern_match.group(1)
+    from utils import database as db
+    data = db.get_module_data("wisp", f"msg_{wisp_id}")
+
+    if not data:
+        return "❌ Сообщение не найдено", []
+
+    recipient_name = data.get("recipient_name", "Пользователь")
+    
+    text = f"🔐 <b>Секретное сообщение для {recipient_name}</b>\n\n<i>Прочитать его может только получатель и отправитель.</i>"
+    buttons = [
+        [Button.inline("📥 Прочитать сообщение", data=f"wisp_read:{wisp_id}")]
+    ]
+    
+    return text, buttons
+
+@callback_handler(r"wisp_read:(.+)")
+async def wisp_read_callback(event):
+    wisp_id = event.pattern_match.group(1)
+    from utils import database as db
+    data = db.get_module_data("wisp", f"msg_{wisp_id}")
+
+    if not data:
+        return await event.answer("❌ Сообщение больше не доступно.", alert=True)
+
+    recipient_id = data.get("recipient_id")
+    sender_id = data.get("sender_id")
+    text = data.get("text")
+    
+    user_id = event.sender_id
+
+    # Принудительно приводим всё к int для корректного сравнения
+    try:
+        u_id = int(user_id)
+        r_id = int(recipient_id)
+        s_id = int(sender_id)
+    except (ValueError, TypeError):
+        return await event.answer("❌ Ошибка проверки прав доступа.", alert=True)
+
+    if u_id == r_id or u_id == s_id:
+        await event.answer(text, alert=True)
+    else:
+        # Временно добавляем ID для отладки, чтобы понять причину несовпадения
+        await event.answer(f"🔒 Это сообщение не для вас!\n(Ваш ID: {u_id}, Ожидаемый: {r_id})", alert=True)
+
+@inline_handler(r"wisp\s+(\d+|@\w+)\s+(.*)", title="🔐 Отправить секретку", description="Используйте: wisp <id/user> <текст>")
+async def wisp_create_inline(event):
+    from utils import database as db
+    sender_id = int(event.sender_id)
+    if db.get_user_level(sender_id) not in ["OWNER", "TRUSTED"]:
+        return "🚫 Доступ запрещен. Использовать инлайн-команды могут только OWNER и TRUSTED пользователи.", [[Button.url("🐾 KoteLoader", "https://t.me/KoteLoader")]]
+
+    target = event.pattern_match.group(1)
+    message_text = event.pattern_match.group(2).strip()
+    
+    if not message_text:
+        return "❌ Введите текст", []
+
+    try:
+        user = await event.client.get_entity(target)
+        recipient_id = int(user.id)
+        recipient_name = user.first_name or "Пользователь"
+    except:
+        # Если бот не видит юзера, но введен ID - используем его напрямую
+        if target.isdigit() or (target.startswith("-") and target[1:].isdigit()):
+            recipient_id = int(target)
+        else:
+            recipient_id = 0
+        recipient_name = target
+
+    wisp_id = str(uuid.uuid4())[:8]
+
+    from utils import database as db
+    db.set_module_data("wisp", f"msg_{wisp_id}", {
+        "text": message_text[:200],
+        "recipient_id": int(recipient_id),
+        "sender_id": int(sender_id),
+        "recipient_name": recipient_name
+    })
+
+    text = f"🔐 <b>Секретное сообщение для {recipient_name}</b>\n\n<i>Прочитать его может только получатель и отправитель.</i>"
+    buttons = [[Button.inline("📥 Прочитать сообщение", data=f"wisp_read:{wisp_id}")]]
+    
+    return text, buttons
