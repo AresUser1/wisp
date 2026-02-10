@@ -1,7 +1,7 @@
 # modules/wisp.py
 """
 <manifest>
-version: 1.0.2
+version: 1.0.3
 source: https://raw.githubusercontent.com/AresUser1/wisp/main/wisp.py
 author: SynForge
 </manifest>
@@ -58,23 +58,26 @@ async def wisp_cmd(event):
     wisp_id = str(uuid.uuid4())[:8]
     await event.edit(f"@{bot_username} wisp:{wisp_id}")
 
-    try:
-        # Теперь спокойно ищем пользователя
-        if target.startswith("@"):
+    recipient_id = 0
+    recipient_name = target
+
+    # 1. Проверяем на ID
+    clean_target = target.lstrip("-")
+    if clean_target.isdigit():
+        recipient_id = int(target)
+        try:
+            user = await event.client.get_entity(recipient_id)
+            recipient_name = user.first_name or f"ID: {recipient_id}"
+        except:
+            recipient_name = f"ID: {target}"
+    else:
+        # 2. Пробуем как юзернейм
+        try:
             user = await event.client.get_entity(target)
             recipient_id = int(user.id)
-            recipient_name = user.first_name or "Пользователь"
-        else:
-            try:
-                user = await event.client.get_entity(int(target))
-                recipient_id = int(user.id)
-                recipient_name = user.first_name or "Пользователь"
-            except:
-                # Если бот не видит юзера, но введен ID - используем его напрямую
-                recipient_id = int(target)
-                recipient_name = target
-    except Exception as e:
-        return await event.edit(f"❌ <b>Не удалось найти пользователя:</b> <code>{target}</code>", parse_mode='html')
+            recipient_name = user.first_name or target
+        except Exception as e:
+            return await event.edit(f"❌ <b>Пользователь '{target}' не найден.</b>", parse_mode='html')
 
     sender_id = (await event.client.get_me()).id
 
@@ -128,42 +131,53 @@ async def wisp_read_callback(event):
         r_id = int(recipient_id)
         s_id = int(sender_id)
     except (ValueError, TypeError):
-        return await event.answer("❌ Ошибка проверки прав доступа.", alert=True)
+        return await event.answer("❌ Ошибка данных сообщения.", alert=True)
 
     if u_id == r_id or u_id == s_id:
         await event.answer(text, alert=True)
     else:
-        # Временно добавляем ID для отладки, чтобы понять причину несовпадения
-        await event.answer(f"🔒 Это сообщение не для вас!\n(Ваш ID: {u_id}, Ожидаемый: {r_id})", alert=True)
+        await event.answer(f"🔒 Это сообщение не для вас!\n(Ваш ID: {u_id}, ожидался: {r_id})", alert=True)
 
-@inline_handler(r"wisp\s+(\d+|@\w+)\s+(.*)", title="🔐 Отправить секретку", description="Используйте: wisp <id/user> <текст>")
+@inline_handler(r"wisp\s+(\S+)\s+(.*)", title="🔐 Отправить секретку", description="Используйте: wisp <id/user> <текст>")
 async def wisp_create_inline(event):
     from utils import database as db
     sender_id = int(event.sender_id)
+    
+    # Секретки могут отправлять все, если это не запрещено глобально
+    # Но для безопасности оставим проверку OWNER/TRUSTED для СОЗДАНИЯ через инлайн
     if db.get_user_level(sender_id) not in ["OWNER", "TRUSTED"]:
-        return "🚫 Доступ запрещен. Использовать инлайн-команды могут только OWNER и TRUSTED пользователи.", [[Button.url("🐾 KoteLoader", "https://t.me/KoteLoader")]]
+        return "🚫 Создание секреток через инлайн доступно только доверенным пользователям.", [[Button.url("🐾 KoteLoader", "https://t.me/KoteLoader")]]
 
-    target = event.pattern_match.group(1)
+    target = event.pattern_match.group(1).strip()
     message_text = event.pattern_match.group(2).strip()
     
     if not message_text:
         return "❌ Введите текст", []
 
-    try:
-        user = await event.client.get_entity(target)
-        recipient_id = int(user.id)
-        recipient_name = user.first_name or "Пользователь"
-    except:
-        # Если бот не видит юзера, но введен ID - используем его напрямую
-        if target.isdigit() or (target.startswith("-") and target[1:].isdigit()):
-            recipient_id = int(target)
-        else:
-            recipient_id = 0
-        recipient_name = target
+    recipient_id = 0
+    recipient_name = target
+
+    # 1. Проверяем, не является ли target чистым ID (числа или -100...)
+    clean_target = target.lstrip("-")
+    if clean_target.isdigit():
+        recipient_id = int(target)
+        # Пытаемся получить имя для красоты, если не выйдет - оставим ID
+        try:
+            user = await event.client.get_entity(recipient_id)
+            recipient_name = user.first_name or f"ID: {recipient_id}"
+        except:
+            recipient_name = f"ID: {target}"
+    else:
+        # 2. Если это не ID, пробуем как юзернейм/сущность
+        try:
+            user = await event.client.get_entity(target)
+            recipient_id = int(user.id)
+            recipient_name = user.first_name or target
+        except:
+            return f"❌ Пользователь '{target}' не найден.", []
 
     wisp_id = str(uuid.uuid4())[:8]
 
-    from utils import database as db
     db.set_module_data("wisp", f"msg_{wisp_id}", {
         "text": message_text[:200],
         "recipient_id": int(recipient_id),
