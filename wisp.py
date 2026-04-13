@@ -1,7 +1,7 @@
 # modules/wisp.py
 """
 <manifest>
-version: 1.0.3
+version: 1.0.4
 source: https://raw.githubusercontent.com/AresUser1/wisp/main/wisp.py
 author: SynForge
 </manifest>
@@ -41,9 +41,17 @@ async def wisp_cmd(event):
     if not message_text:
         return await event.edit("❌ <b>Введите текст сообщения.</b>", parse_mode='html')
 
-    # Ограничение на длину
-    if len(message_text) > 200:
-        message_text = message_text[:197] + "..."
+    # Лимит answerCallbackQuery — 200 байт UTF-8.
+    # Русский текст ~2 байта/символ, поэтому реальный лимит ~100 кириллических символов.
+    msg_bytes = len(message_text.encode('utf-8'))
+    if msg_bytes > 200:
+        over = msg_bytes - 200
+        msg = (
+            "❌ <b>Текст слишком длинный!</b>\n"
+            f"Лимит: <b>200 байт</b>, у вас: <b>{msg_bytes}</b> (+{over} лишних).\n"
+            "<i>Совет: ~100 кириллических или ~200 латинских символов.</i>"
+        )
+        return await event.edit(msg, parse_mode='html')
 
     if not event.client.bot_client:
         return await event.edit("❌ <b>Бот-помощник не подключен!</b>", parse_mode='html')
@@ -154,6 +162,14 @@ async def wisp_create_inline(event):
     if not message_text:
         return "❌ Введите текст", []
 
+    msg_bytes = len(message_text.encode('utf-8'))
+    if msg_bytes > 200:
+        over = msg_bytes - 200
+        return (
+            f"❌ Текст слишком длинный! Лимит: 200 байт, у вас: {msg_bytes} (+{over} лишних). Совет: ~100 кириллических или ~200 латинских символов.",
+            []
+        )
+
     recipient_id = 0
     recipient_name = target
 
@@ -179,7 +195,7 @@ async def wisp_create_inline(event):
     wisp_id = str(uuid.uuid4())[:8]
 
     db.set_module_data("wisp", f"msg_{wisp_id}", {
-        "text": message_text[:200],
+        "text": message_text,
         "recipient_id": int(recipient_id),
         "sender_id": int(sender_id),
         "recipient_name": recipient_name
