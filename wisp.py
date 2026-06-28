@@ -11,13 +11,19 @@ author: SynForge
 
 import uuid
 import re
+import html
 from telethon import events
 from telethon.tl.custom import Button
+from telethon.tl.types import ReplyInlineMarkup
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.errors import RPCError
 
 from utils.loader import register, inline_handler, callback_handler
 from handlers.user_commands import _call_inline_bot
+
+WISP_CLOSE_KEY = "close_on_read"
+WISP_TEMPLATE_KEY = "close_text_template"
+DEFAULT_CLOSE_TEMPLATE = "{name} прочитал(а) секретку."
 
 @register("wisp")
 async def wisp_cmd(event):
@@ -100,6 +106,59 @@ async def wisp_cmd(event):
     query = f"wisp:{wisp_id}"
     await _call_inline_bot(event, query)
 
+@register("wispcfg")
+async def wispcfg_cmd(event):
+    """Настройки секреток: что показывать после прочтения.
+
+    Usage:
+    {prefix}wispcfg — показать текущие настройки
+    {prefix}wispcfg close on|off — менять карточку на "прочитал(а)" после открытия (по умолчанию on)
+    {prefix}wispcfg text <шаблон> — свой текст вместо стандартного. Плейсхолдер {name} — кликабельное имя прочитавшего.
+    {prefix}wispcfg text reset — вернуть текст по умолчанию
+    """
+    from utils import database as db
+    args = (event.pattern_match.group(1) or "").strip()
+
+    if not args:
+        close_on_read = db.get_module_data("wisp", WISP_CLOSE_KEY, default=True)
+        template = db.get_module_data("wisp", WISP_TEMPLATE_KEY, default=DEFAULT_CLOSE_TEMPLATE)
+        status = "включено ✅" if close_on_read else "выключено ⛔️"
+        p = db.get_setting("prefix", default=".")
+        return await event.edit(
+            "🔐 <b>Настройки секреток (wisp)</b>\n\n"
+            f"Замена карточки после прочтения: <b>{status}</b>\n"
+            f"Текст после прочтения: <code>{html.escape(template)}</code>\n\n"
+            f"<i>{p}wispcfg close on/off — включить/выключить\n"
+            f"{p}wispcfg text &lt;шаблон&gt; — свой текст ({{name}} — имя со ссылкой)\n"
+            f"{p}wispcfg text reset — вернуть текст по умолчанию</i>",
+            parse_mode='html'
+        )
+
+    parts = args.split(maxsplit=1)
+    sub = parts[0].lower()
+
+    if sub == "close":
+        if len(parts) < 2 or parts[1].strip().lower() not in ("on", "off"):
+            return await event.edit("❌ Используйте: <code>.wispcfg close on</code> или <code>.wispcfg close off</code>", parse_mode='html')
+        value = parts[1].strip().lower() == "on"
+        db.set_module_data("wisp", WISP_CLOSE_KEY, value)
+        status = "включена" if value else "выключена"
+        return await event.edit(f"✅ Замена карточки после прочтения <b>{status}</b>.", parse_mode='html')
+
+    if sub == "text":
+        if len(parts) < 2 or not parts[1].strip():
+            return await event.edit("❌ Укажите текст шаблона или <code>reset</code>.", parse_mode='html')
+        new_text = parts[1].strip()
+        if new_text.lower() == "reset":
+            db.set_module_data("wisp", WISP_TEMPLATE_KEY, DEFAULT_CLOSE_TEMPLATE)
+            return await event.edit("✅ Текст после прочтения сброшен на стандартный.", parse_mode='html')
+
+        db.set_module_data("wisp", WISP_TEMPLATE_KEY, new_text)
+        preview = _build_read_notice(new_text, "Вася", 123456789)
+        return await event.edit(f"✅ Текст после прочтения обновлён.\n\n<b>Превью:</b> {preview}", parse_mode='html')
+
+    return await event.edit("❌ Неизвестная подкоманда. Используйте <code>close</code> или <code>text</code>.", parse_mode='html')
+
 @inline_handler(r"wisp:(.+)", title="Секретное сообщение", description="Отправить секретку")
 async def wisp_inline(event):
     wisp_id = event.pattern_match.group(1)
@@ -118,7 +177,26 @@ async def wisp_inline(event):
     
     return text, buttons
 
-@callback_handler(r"wisp_read:(.+)")
+def _build_read_notice(template: str, reader_name: str, user_id: int) -> str:
+    """
+    HTML-текст, которым заменяется секретка после прочтения.
+    {name} в шаблоне подставляется уже кликабельной ссылкой на аккаунт
+    прочитавшего, {id} — его числовым ID. Имя экранируем — оно приходит
+    от Telegram (first_name/title) и может содержать символы, которые
+    поломают HTML-разметку при parse_mode='html'.
+
+    Если в шаблоне опечатка в плейсхолдере (например, одиночная "{"),
+    откатываемся на стандартный текст, а не роняем хендлер.
+    """
+    safe_name = html.escape(reader_name)
+    name_link = f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+    try:
+        return template.format(name=name_link, id=user_id)
+    except (KeyError, IndexError, ValueError):
+        return f'{name_link} прочитал(а) секретку.'
+
+
+@callback_handler(r"wisp_read:(.+)", unrestricted=True)
 async def wisp_read_callback(event):
     wisp_id = event.pattern_match.group(1)
     from utils import database as db
@@ -141,10 +219,98 @@ async def wisp_read_callback(event):
     except (ValueError, TypeError):
         return await event.answer("❌ Ошибка данных сообщения.", alert=True)
 
-    if u_id == r_id or u_id == s_id:
-        await event.answer(text, alert=True)
-    else:
-        await event.answer(f"🔒 Это сообщение не для вас!\n(Ваш ID: {u_id}, ожидался: {r_id})", alert=True)
+    if u_id != r_id and u_id != s_id:
+        return await event.answer(f"🔒 Это сообщение не для вас!\n(Ваш ID: {u_id}, ожидался: {r_id})", alert=True)
+
+    # Если секретка уже прочитана — показываем кто прочитал, секрет не раскрываем повторно.
+    if data.get("read"):
+        _reader = data.get("reader_name", f"ID {data.get('read_by', '?')}")
+        return await event.answer(f"✅ Секретку уже прочитал(а) {_reader}", alert=False)
+
+    # Показываем секрет отправителю или получателю (первое нажатие)
+    await event.answer(text, alert=True)
+
+    # Карточку меняем ТОЛЬКО когда читает получатель, не отправитель.
+    if u_id != r_id:
+        return
+
+    # Поведение после прочтения — если пользователь выключил замену карточки,
+    # ничего не трогаем.
+    close_on_read = db.get_module_data("wisp", WISP_CLOSE_KEY, default=True)
+    if not close_on_read:
+        return
+
+    reader_name = f"ID {u_id}"
+    try:
+        reader = await event.get_sender()
+        reader_name = getattr(reader, "first_name", None) or getattr(reader, "title", None) or reader_name
+    except Exception:
+        pass
+
+    # Сохраняем имя для повторных кликов на "✅ Прочитано"
+    data["read"] = True
+    data["read_by"] = u_id
+    data["reader_name"] = reader_name
+    db.set_module_data("wisp", f"msg_{wisp_id}", data)
+
+    template = db.get_module_data("wisp", WISP_TEMPLATE_KEY, default=DEFAULT_CLOSE_TEMPLATE)
+    closed_text = _build_read_notice(template, reader_name, u_id)
+
+    # Правим карточку через EditInlineBotMessageRequest напрямую.
+    # Получаем InputBotInlineMessageID через original_update — надёжный путь,
+    # который использует bot_callbacks.py (_HtmlCallProxy.edit / delete).
+    #
+    # Кнопку убираем не передавая reply_markup вообще (flag.2 не выставляется).
+    # Telegram при замене текста без reply_markup убирает inline-клавиатуру.
+    # ReplyInlineMarkup(rows=[]) явно отклоняется сервером (REPLY_MARKUP_INVALID),
+    # поэтому единственный рабочий способ — опустить поле целиком.
+    try:
+        from telethon import functions as _tl_f
+        from telethon.extensions import html as _tl_html
+        from telethon.tl.types import ReplyKeyboardHide as _RKH
+
+        # InputBotInlineMessageID через original_update (как в bot_callbacks.py)
+        _raw = getattr(event, "original_update", None)
+        _iid = None
+        if _raw is not None and type(_raw).__name__ == "UpdateInlineBotCallbackQuery":
+            _iid = getattr(_raw, "msg_id", None)
+        if _iid is None:
+            _q = getattr(event, "query", None)
+            if _q is not None:
+                _iid = getattr(_q, "msg_id", None)
+        if _iid is None:
+            _iid = getattr(event, "inline_message_id", None)
+
+        if _iid is not None:
+            _msg_text, _entities = _tl_html.parse(closed_text)
+            # Попытка 1: reply_markup не передаём — Telegram убирает кнопки
+            # при замене текста без явной клавиатуры.
+            _req = _tl_f.messages.EditInlineBotMessageRequest(
+                id=_iid,
+                message=_msg_text,
+                entities=_entities,
+                no_webpage=True,
+            )
+            try:
+                await event.client(_req)
+            except Exception as _e1:
+                import logging as _wlog
+                _wlog.getLogger("wisp").warning(f"[wisp_read] edit pass1 failed: {_e1}")
+                # Попытка 2: ReplyKeyboardHide — говорит серверу убрать клавиатуру
+                try:
+                    _req2 = _tl_f.messages.EditInlineBotMessageRequest(
+                        id=_iid,
+                        message=_msg_text,
+                        entities=_entities,
+                        reply_markup=_RKH(),
+                        no_webpage=True,
+                    )
+                    await event.client(_req2)
+                except Exception as _e2:
+                    _wlog.getLogger("wisp").warning(f"[wisp_read] edit pass2 failed: {_e2}")
+    except Exception as _edit_err:
+        import logging as _wlog
+        _wlog.getLogger("wisp").warning(f"[wisp_read] edit_inline failed: {_edit_err}")
 
 @inline_handler(r"wisp\s+(\S+)\s+(.*)", title="🔐 Отправить секретку", description="Используйте: wisp <id/user> <текст>")
 async def wisp_create_inline(event):
